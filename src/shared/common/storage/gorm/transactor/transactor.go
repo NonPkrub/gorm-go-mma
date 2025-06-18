@@ -4,6 +4,8 @@ package transactor
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -16,7 +18,7 @@ type Transactor interface {
 
 type (
 	gormDBGetter               func(context.Context) *gorm.DB
-	nestedTransactionsStrategy func(tx *gorm.DB) (*gorm.DB, func() error)
+	nestedTransactionsStrategy func(tx *gorm.DB) (*gorm.DB, func(commit bool) error)
 )
 
 type gormTransactor struct {
@@ -28,8 +30,6 @@ type Option func(*gormTransactor)
 
 type (
 	transactorKey struct{}
-	// DBTXContext is used to get the current DB handler from the context.
-	// It returns the current transaction if there is one, otherwise it will return the original DB.
 )
 
 func txToContext(ctx context.Context, tx *gorm.DB) context.Context {
@@ -86,9 +86,10 @@ func (t *gormTransactor) WithinTransaction(ctx context.Context, txFunc func(ctxW
 			ctxWithTx := txToContext(ctx, nestedTx)
 
 			if err := txFunc(ctxWithTx, registerPostCommitHook); err != nil {
+				_ = commit(false)
 				return err
 			}
-			if err := commit(); err != nil {
+			if err := commit(true); err != nil {
 				return err
 			}
 		} else {
@@ -122,15 +123,27 @@ func IsWithinTransaction(ctx context.Context) bool {
 	return txFromContext(ctx) != nil
 }
 
-// NestedTransactionsSavepoints is a nested transactions implementation using savepoints.
-// It's compatible with PostgreSQL, MySQL, MariaDB, and SQLite.
-var NestedTransactionsSavepoints nestedTransactionsStrategy = func(tx *gorm.DB) (*gorm.DB, func() error) {
-	savepoint := "sp1" // generate unique name if needed
+// generateSavepointName สร้างชื่อ savepoint ไม่ซ้ำ
+var seededRand *rand.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func generateSavepointName() string {
+	return fmt.Sprintf("sp_%d", seededRand.Intn(1_000_000))
+}
+
+// nestedTransactionsStrategy ที่รองรับ commit และ rollback
+var NestedTransactionsSavepoints nestedTransactionsStrategy = func(tx *gorm.DB) (*gorm.DB, func(commit bool) error) {
+	savepoint := generateSavepointName()
+
+	// สร้าง SAVEPOINT
 	if err := tx.Exec("SAVEPOINT " + savepoint).Error; err != nil {
-		return tx, func() error { return err }
+		return tx, func(_ bool) error { return err }
 	}
 
-	return tx, func() error {
-		return tx.Exec("RELEASE SAVEPOINT " + savepoint).Error
+	// ฟังก์ชัน commit/rollback
+	return tx, func(commit bool) error {
+		if commit {
+			return tx.Exec("RELEASE SAVEPOINT " + savepoint).Error
+		}
+		return tx.Exec("ROLLBACK TO SAVEPOINT " + savepoint).Error
 	}
 }
